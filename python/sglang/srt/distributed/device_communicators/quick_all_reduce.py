@@ -38,26 +38,6 @@ def qr_rocm_arch_available():
         return False
 
 
-def _flydsl_int4_available() -> bool:
-    """Whether this process can run AITER FlyDSL INT4 QuickReduce.
-
-    True only on gfx950 when SGLANG_USE_AITER is on and AITER exports
-    QuickAllReduceInt4. Any other host keeps the HIP INT4 kernel.
-    """
-    from sglang.srt.environ import envs
-    from sglang.srt.utils import is_gfx95_supported
-
-    if not envs.SGLANG_USE_AITER.get():
-        return False
-    if not is_gfx95_supported():
-        return False
-    try:
-        from aiter.ops.flydsl import QuickAllReduceInt4  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
 class QuickReduceRegime(Enum):
     FP = 0
     INT8 = 1
@@ -70,8 +50,6 @@ MB = 1024 * 1024
 
 
 class QuickAllReduce:
-    # Set before __init__ returns so close() is safe on a half-built instance.
-    _flydsl_int4 = None
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -108,7 +86,6 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
-        self._flydsl_int4 = None
         self._ptr = 0
         if not qr_rocm_arch_available():
             logger.debug(
@@ -230,34 +207,10 @@ class QuickAllReduce:
                 )
             qr_max_size = qr_max_size * MB
 
-        # HIP QuickReduce always owns its IPC workspace. On gfx950, FlyDSL is
-        # created beside it and takes the bf16 payloads it can run.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
-        if self.qr_quant_level == QuickReduceRegime.INT4 and _flydsl_int4_available():
-            self._init_flydsl_int4()
         self.disabled = False
-
-    def _init_flydsl_int4(self) -> None:
-        """Create FlyDSL beside the HIP workspace when this GPU can run it.
-        """
-
-        from aiter.ops.flydsl import QuickAllReduceInt4
-
-        self._flydsl_int4 = QuickAllReduceInt4(
-            group=self.group,
-            device=self.device,
-            rank=self.rank,
-            world_size=self.world_size,
-        )
-        warmup = torch.empty(MB, dtype=torch.bfloat16, device=self.device)
-        self._flydsl_int4.compile(warmup, torch.empty_like(warmup))
-        torch.cuda.synchronize(self.device)
-        logger.info(
-            "Using AITER FlyDSL INT4 QuickReduce for BF16 payloads; other "
-            "payloads use the HIP QuickReduce kernels."
-        )
 
     def create_shared_buffer(self):
         """
@@ -300,100 +253,12 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
-        if self._use_flydsl_int4(inp):
-            self._flydsl_int4.allreduce(inp, out)
-            return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
 
-    def _use_flydsl_int4(self, inp: torch.Tensor) -> bool:
-        """FlyDSL accepts bf16 only, and only when the bytes are launchable.
-
-        fp16, non-contiguous, and misaligned payloads stay on the HIP kernel.
-        The HIP size window is applied by should_quick_allreduce before this
-        call; FlyDSL itself allows any bf16 payload up to 4 GiB.
-        """
-        return (
-            self._flydsl_int4 is not None
-            and self.qr_quant_level == QuickReduceRegime.INT4
-            and inp.dtype == torch.bfloat16
-            and inp.is_contiguous()
-            and inp.data_ptr() % 16 == 0
-        )
-
-    def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
-        """Whether ``quick_all_reduce`` runs ``inp`` through FlyDSL."""
-        return self.should_quick_allreduce(inp) and self._use_flydsl_int4(inp)
-
-    def fused_rmsnorm_limit_bytes(self, inp: torch.Tensor) -> Optional[int]:
-        """Largest all-reduce that FlyDSL can fuse with add-RMSNorm, or None.
-
-        The custom-all-reduce fused kernel stops at its 64 MB pool. FlyDSL
-        stages this fusion through the QuickReduce workspace instead, so a
-        prefill chunk above that pool can still fuse when this returns a size.
-        """
-        if not self.uses_flydsl_int4(inp):
-            return None
-        supports = getattr(self._flydsl_int4, "supports_rmsnorm", None)
-        if supports is None:
-            return None
-        nbytes = inp.numel() * inp.element_size()
-        if not supports(inp.shape[-1], nbytes):
-            return None
-        return int(self.qr_max_size)
-
-    def should_fused_allreduce_rmsnorm(
-        self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-    ) -> bool:
-        """Whether FlyDSL INT4 can fuse this all-reduce with add + RMSNorm.
-
-        ``weight`` is applied as given. Gemma callers already pass ``1 + w``,
-        so this does not set the kernel's Gemma flag.
-        """
-        if not self.uses_flydsl_int4(inp):
-            return False
-        supports = getattr(self._flydsl_int4, "supports_rmsnorm", None)
-        if supports is None:
-            return False
-        hidden = inp.shape[-1]
-        return (
-            bool(supports(hidden, inp.numel() * inp.element_size()))
-            and residual.shape == inp.shape
-            and residual.dtype == inp.dtype
-            and residual.is_contiguous()
-            and residual.data_ptr() % 16 == 0
-            and weight.dtype == inp.dtype
-            and weight.shape == (hidden,)
-            and weight.is_contiguous()
-            and weight.data_ptr() % 16 == 0
-        )
-
-    def fused_allreduce_rmsnorm(
-        self,
-        inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """FlyDSL INT4 all-reduce of ``inp`` fused with add + RMSNorm.
-
-        Returns ``(rmsnorm(allreduce(inp) + residual), allreduce(inp) + residual)``.
-        """
-        assert self._flydsl_int4 is not None
-        out = torch.empty_like(inp)
-        residual_out = torch.empty_like(residual)
-        self._flydsl_int4.allreduce_rmsnorm(
-            inp, residual, weight, epsilon, out, residual_out, gemma_norm=False
-        )
-        return out, residual_out
-
     def close(self):
-        flydsl = getattr(self, "_flydsl_int4", None)
-        if flydsl is not None:
-            flydsl.close()
-            self._flydsl_int4 = None
         if not self.disabled and getattr(self, "_ptr", None):
             if ops is not None:
                 ops.qr_destroy(self._ptr)
@@ -405,10 +270,16 @@ class QuickAllReduce:
 
 
 class _QuickAllReduceAdapter:
-    """Expose the SGLang QuickReduce interface for bundled and AITER backends."""
+    """Expose the SGLang QuickReduce interface for bundled and AITER backends.
 
-    def __init__(self, communicator: Any) -> None:
+    ``flydsl`` marks an AITER QuickAllReduce created with ``AITER_FLY_AR=1``.
+    AITER then picks FlyDSL or its HIP kernel per payload, and SGLang reaches
+    FlyDSL only through that dispatcher's public methods.
+    """
+
+    def __init__(self, communicator: Any, *, flydsl: bool = False) -> None:
         self._communicator = communicator
+        self._flydsl = flydsl
 
     @property
     def disabled(self) -> bool:
@@ -431,22 +302,36 @@ class _QuickAllReduceAdapter:
         return reduce(inp, out=out)
 
     def uses_flydsl_int4(self, inp: torch.Tensor) -> bool:
-        uses = getattr(self._communicator, "uses_flydsl_int4", None)
-        if uses is None:
-            return False
-        return bool(uses(inp))
+        """Whether the AITER FlyDSL dispatcher owns ``inp``.
+
+        AITER does not say which of its kernels takes a payload, so this is
+        true for every payload that dispatcher accepts. The caller then keeps
+        the all-reduce on QuickReduce rather than custom all-reduce fusion.
+        """
+        return self._flydsl and self.should_quick_allreduce(inp)
 
     def fused_rmsnorm_limit_bytes(self, inp: torch.Tensor) -> Optional[int]:
-        limit = getattr(self._communicator, "fused_rmsnorm_limit_bytes", None)
-        if limit is None:
+        """Largest all-reduce AITER may fuse with add + RMSNorm, or None.
+
+        The custom-all-reduce fused kernel stops at its 64 MB pool. The AITER
+        FlyDSL fusion runs through the QuickReduce workspace instead.
+        """
+        if not hasattr(self._communicator, "should_fly_allreduce_rmsnorm"):
             return None
-        value = limit(inp)
-        return None if value is None else int(value)
+        if not self.uses_flydsl_int4(inp):
+            return None
+        limit = getattr(self._communicator, "qr_max_size", None)
+        return None if limit is None else int(limit)
 
     def should_fused_allreduce_rmsnorm(
         self, inp: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
     ) -> bool:
-        should = getattr(self._communicator, "should_fused_allreduce_rmsnorm", None)
+        """Whether AITER's FlyDSL fused all-reduce + add + RMSNorm takes this
+        call. ``weight`` is applied as given, so Gemma callers pass ``1 + w``.
+        """
+        if not self._flydsl:
+            return False
+        should = getattr(self._communicator, "should_fly_allreduce_rmsnorm", None)
         if should is None:
             return False
         return bool(should(inp, residual, weight))
@@ -458,9 +343,8 @@ class _QuickAllReduceAdapter:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._communicator.fused_allreduce_rmsnorm(
-            inp, residual, weight, epsilon
-        )
+        """``(rmsnorm(allreduce(inp) + residual), allreduce(inp) + residual)``."""
+        return self._communicator.fly_allreduce_rmsnorm(inp, residual, weight, epsilon)
 
     def close(self) -> None:
         close = getattr(self._communicator, "close", None)
@@ -477,9 +361,14 @@ _QUICK_REDUCE_ENV_ALIASES = {
 # Codecs served by the bundled INT8 codec. AITER has no INT8 codec, and
 # released AITER FP8 returns NaN for near-zero blocks with FP16 kernels.
 _BUNDLED_INT8_CODECS = ("INT8", "FP8")
-# INT4 stays on the bundled communicator. FlyDSL or the HIP kernel is chosen
-# later, per payload.
+# INT4 stays on the bundled HIP codec unless AITER_FLY_AR=1 asks for AITER's
+# FlyDSL dispatcher.
 _BUNDLED_INT4_CODECS = ("INT4",)
+
+
+def _aiter_flydsl_requested() -> bool:
+    """Whether ``AITER_FLY_AR=1`` opts in to AITER's FlyDSL all-reduce."""
+    return os.environ.get("AITER_FLY_AR", "").strip() == "1"
 
 
 def _configure_aiter_quickreduce_env() -> None:
@@ -513,9 +402,9 @@ def _configure_bundled_int8_env() -> None:
 def _configure_bundled_int4_env() -> None:
     """Select the bundled INT4 codec, mirroring AITER's legacy aliases.
 
-    The bundled communicator owns the FlyDSL dispatch. It therefore must see
-    the legacy ROCM_QUICK_REDUCE_* settings even when the caller only supplied
-    the AITER aliases accepted by the PR 40771 factory.
+    The bundled communicator reads only the legacy ROCM_QUICK_REDUCE_*
+    settings, so it must see them even when the caller only supplied the
+    AITER aliases accepted by the PR 40771 factory.
     """
     os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = "INT4"
     for legacy_name, aiter_name in _QUICK_REDUCE_ENV_ALIASES.items():
@@ -529,9 +418,10 @@ def create_quick_allreduce(
     """Create the configured QuickReduce communicator.
 
     AITER is opt-in through ``SGLANG_USE_AITER``. INT8 and FP8 requests run
-    on the bundled INT8 codec. INT4 stays on the bundled communicator too:
-    FlyDSL or the HIP kernel is chosen later, per payload. Other codecs use
-    AITER QuickAllReduce.
+    on the bundled INT8 codec. INT4 runs on the bundled HIP codec, or with
+    ``AITER_FLY_AR=1`` on AITER QuickAllReduce, which serves the payloads its
+    FlyDSL policy covers with FlyDSL and the rest with its HIP kernel. Other
+    codecs use AITER QuickAllReduce.
     Constructor failures intentionally propagate: distributed initialization
     may already have exchanged resources, so silently creating a second
     communicator is unsafe.
@@ -549,7 +439,8 @@ def create_quick_allreduce(
             )
             _configure_bundled_int8_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
-        if codec in _BUNDLED_INT4_CODECS:
+        flydsl = codec in _BUNDLED_INT4_CODECS and _aiter_flydsl_requested()
+        if codec in _BUNDLED_INT4_CODECS and not flydsl:
             logger.info("Using bundled QuickAllReduce INT4 codec")
             _configure_bundled_int4_env()
             return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
@@ -564,9 +455,14 @@ def create_quick_allreduce(
                 exc,
             )
         else:
-            logger.info("Using AITER QuickAllReduce")
-            return _QuickAllReduceAdapter(
-                AiterQuickAllReduce(group=group, device=device)
+            logger.info(
+                "Using AITER QuickAllReduce%s",
+                " with FlyDSL (AITER_FLY_AR=1)" if flydsl else "",
             )
+            return _QuickAllReduceAdapter(
+                AiterQuickAllReduce(group=group, device=device), flydsl=flydsl
+            )
+        if flydsl:
+            _configure_bundled_int4_env()
 
     return _QuickAllReduceAdapter(QuickAllReduce(group=group, device=device))
